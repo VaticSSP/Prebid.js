@@ -210,10 +210,7 @@ function _getDigiTrustQueryParams() {
  * e.g., https://prebid.adnxs.com/pbs/v1/auction
  */
 const legacy = {
-  // build payload for endpoint
-  buildRequest(s2sBidRequest, ad_units) {
-    const isDebug = !!getConfig('debug');
-
+  buildRequest(s2sBidRequest, adUnits) {
     const request = {
       account_id: _s2sConfig.accountId,
       tid: s2sBidRequest.tid,
@@ -223,20 +220,19 @@ const legacy = {
       cache_markup: _s2sConfig.cacheMarkup,
       url: utils.getTopWindowUrl(),
       prebid_version: '$prebid.version$',
-      ad_units: ad_units,
-      is_debug: isDebug,
+      ad_units: adUnits,
+      is_debug: !!getConfig('debug'),
     };
-
-    let digiTrust = _getDigiTrustQueryParams();
 
     // grab some global config and pass it along
     ['app', 'device'].forEach(setting => {
       let value = getConfig(setting);
       if (typeof value === 'object') {
-        requestJson[setting] = value;
+        request[setting] = value;
       }
     });
 
+    let digiTrust = _getDigiTrustQueryParams();
     if (digiTrust) {
       request.digiTrust = digiTrust;
     }
@@ -244,8 +240,9 @@ const legacy = {
     return request;
   },
 
-  // handler for endpoint response
-  interpretResponse(result, addBidResponse, bidRequests, requestedBidders) {
+  interpretResponse(result, bidRequests, requestedBidders) {
+    const bids = [];
+
     if (result.status === 'OK' || result.status === 'no_cookie') {
       if (result.bidder_status) {
         result.bidder_status.forEach(bidder => {
@@ -319,9 +316,7 @@ const legacy = {
           bidObject.currency = (bidObj.currency) ? bidObj.currency : DEFAULT_S2S_CURRENCY;
           bidObject.netRevenue = (bidObj.netRevenue) ? bidObj.netRevenue : DEFAULT_S2S_NETREVENUE;
 
-          if (isValid(bidObj.code, bidObject, bidRequests)) {
-            addBidResponse(bidObj.code, bidObject);
-          }
+          bids.push({ adUnit: bidObj.code, bid: bidObject })
         });
       }
     }
@@ -330,6 +325,8 @@ const legacy = {
       // cookie sync
       cookieSet(_s2sConfig.cookieSetUrl);
     }
+
+    return bids;
   }
 };
 
@@ -338,12 +335,11 @@ const legacy = {
  * e.g., https://prebid.adnxs.com/pbs/v1/openrtb2/auction
  */
 const openRtb = {
-  // build payload for endpoint
-  buildRequest(s2sBidRequest, ad_units) {
+  buildRequest(s2sBidRequest, adUnits) {
     let imps = [];
 
     // transform ad unit into array of OpenRTB impression objects
-    ad_units.forEach(adUnit => {
+    adUnits.forEach(adUnit => {
       let banner;
 
       const bannerParams = utils.deepAccess(adUnit, 'mediaTypes.banner');
@@ -377,8 +373,9 @@ const openRtb = {
     return request;
   },
 
-  // handler for endpoint response
-  interpretResponse(response, addBidResponse, bidRequests, requestedBidders) {
+  interpretResponse(response, bidRequests, requestedBidders) {
+    const bids = [];
+
     if (response.seatbid) {
       response.seatbid.forEach(bidObj => {
         let cpm = bidObj.bid[0].price;
@@ -407,11 +404,11 @@ const openRtb = {
         bidObject.currency = (bidObj.currency) ? bidObj.currency : DEFAULT_S2S_CURRENCY;
         bidObject.netRevenue = (bidObj.netRevenue) ? bidObj.netRevenue : DEFAULT_S2S_NETREVENUE;
 
-        if (isValid(bidObj.bid[0].impid, bidObject, bidRequests)) {
-          addBidResponse(bidObj.bid[0].impid, bidObject);
-        }
+        bids.push({ adUnit: bidObj.bid[0].impid, bid: bidObject });
       });
     }
+
+    return bids;
   }
 };
 
@@ -421,11 +418,11 @@ const openRtb = {
  * and `interpretResponse` functions.
  *
  * Usage:
- *   // build JSON payload to send to server, e.g. in `callBids`
- *   const request = protocol().buildRequest(s2sBidRequest, ad_units);
+ * // build JSON payload to send to server
+ * const request = protocol().buildRequest(s2sBidRequest, adUnits);
  *
- *   // handle server response with using given parameters, e.g. in `handleResponse`
- *   protocol().interpretResponse(response, addBidResponse, bidRequests, requestedBidders);
+ * // turn server response into bid object array
+ * const bids = protocol().interpretResponse(response, bidRequests, requestedBidders);
  */
 const protocol = () => {
   const isOpenRtb = _s2sConfig.endpoint.includes(OPEN_RTB_PATH);
@@ -456,12 +453,15 @@ export function PrebidServer() {
     convertTypes(adUnits);
 
     // at this point ad units should have a size array either directly or mapped so filter for that
-    const ad_units = adUnits.filter(unit => unit.sizes && unit.sizes.length);
+    const adUnitsWithSizes = adUnits.filter(unit => unit.sizes && unit.sizes.length);
 
-    // in case config.bidders contains invalid bidders, we only process those we sent requests for.
-    const requestedBidders = ad_units.map(adUnit => adUnit.bids.map(bid => bid.bidder).filter(utils.uniques)).reduce(utils.flatten).filter(utils.uniques);
+    // in case config.bidders contains invalid bidders, we only process those we sent requests for
+    const requestedBidders = adUnitsWithSizes
+      .map(adUnit => adUnit.bids.map(bid => bid.bidder).filter(utils.uniques))
+      .reduce(utils.flatten)
+      .filter(utils.uniques);
 
-    const request = protocol().buildRequest(s2sBidRequest, ad_units);
+    const request = protocol().buildRequest(s2sBidRequest, adUnitsWithSizes);
     const requestJson = JSON.stringify(request);
 
     ajax(
@@ -478,7 +478,13 @@ export function PrebidServer() {
 
     try {
       result = JSON.parse(response);
-      protocol().interpretResponse(result, addBidResponse, bidRequests, requestedBidders);
+
+      const bids = protocol().interpretResponse(result, bidRequests, requestedBidders);
+      (bids || []).forEach(({adUnit, bid}) => {
+        if (isValid(adUnit, bid, bidRequests)) {
+          addBidResponse(adUnit, bid);
+        }
+      });
     } catch (error) {
       utils.logError(error);
     }
